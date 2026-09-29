@@ -1,0 +1,73 @@
+name: daily-anchor
+on:
+  schedule:
+    - cron: "10 15 * * *"   # 00:10 KST
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: anchor
+jobs:
+  anchor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FG_API_URL: ${{ secrets.FG_API_URL }}
+      JOBS_SECRET: ${{ secrets.JOBS_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 무결성 점검(체인 재계산 + payload 해시 대조)
+        run: curl -sf -X POST "$FG_API_URL/jobs/integrity" -H "x-jobs-secret: $JOBS_SECRET" -H "Content-Type: application/json" -d '{}' | head -c 1500; echo
+      - name: 일일 다이제스트 받기
+        id: dg
+        run: |
+          curl -sf -X POST "$FG_API_URL/jobs/digest" -H "x-jobs-secret: $JOBS_SECRET" -H "Content-Type: application/json" -d '{}' > digest.json
+          DATE=$(python3 -c "import json;print(json.load(open('digest.json'))['body']['date'])")
+          DIGEST=$(python3 -c "import json;print(json.load(open('digest.json'))['digest'])")
+          Y=${DATE:0:4}; M=${DATE:5:2}; D=${DATE:8:2}
+          mkdir -p anchors/$Y/$M
+          F=anchors/$Y/$M/$D.json
+          python3 -c "import json;open('$F','w',encoding='utf-8',newline='').write(json.load(open('digest.json'))['canonical'])"
+          test "$(sha256sum $F | cut -d' ' -f1)" = "$DIGEST"
+          echo "file=$F" >> $GITHUB_OUTPUT; echo "date=$DATE" >> $GITHUB_OUTPUT; echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+      - name: RFC 3161 타임스탬프(FreeTSA, 실패 시 DigiCert)
+        id: tsa
+        run: |
+          F=${{ steps.dg.outputs.file }}
+          openssl ts -query -data $F -sha256 -cert -out $F.tsq
+          if curl -sf -H "Content-Type: application/timestamp-query" --data-binary @$F.tsq https://freetsa.org/tsr -o $F.tsr; then echo "tsa=FreeTSA" >> $GITHUB_OUTPUT;
+          elif curl -sf -H "Content-Type: application/timestamp-query" --data-binary @$F.tsq http://timestamp.digicert.com -o $F.tsr; then echo "tsa=DigiCert" >> $GITHUB_OUTPUT;
+          else echo "tsa=none" >> $GITHUB_OUTPUT; rm -f $F.tsr; fi
+          rm -f $F.tsq
+          [ -f tsa/freetsa-cacert.pem ] || curl -sf https://freetsa.org/files/cacert.pem -o tsa/freetsa-cacert.pem || true
+          [ -f tsa/freetsa-tsa.crt ] || curl -sf https://freetsa.org/files/tsa.crt -o tsa/freetsa-tsa.crt || true
+      - name: OpenTimestamps
+        continue-on-error: true
+        run: |
+          pip install -q opentimestamps-client
+          ots stamp ${{ steps.dg.outputs.file }} || true
+          for f in $(find anchors -name "*.ots" -mtime +0); do ots upgrade "$f" || true; done
+      - name: 커밋
+        id: commit
+        run: |
+          git config user.name "rpx-anchor-bot"
+          git config user.email "anchor-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "anchor ${{ steps.dg.outputs.date }} ${{ steps.dg.outputs.digest }}" || echo "nothing to commit"
+          git push
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+      - name: 앵커 기록 등록
+        run: |
+          F=${{ steps.dg.outputs.file }}
+          B=https://github.com/${{ github.repository }}
+          R=https://raw.githubusercontent.com/${{ github.repository }}/${{ steps.commit.outputs.sha }}
+          python3 - <<PY
+          import json, os, urllib.request
+          body = json.load(open("digest.json"))["body"]
+          f = "$F"
+          data = {"date": "${{ steps.dg.outputs.date }}", "digest": "${{ steps.dg.outputs.digest }}", "body": body,
+                  "commitUrl": "$B/commit/${{ steps.commit.outputs.sha }}", "tsa": "${{ steps.tsa.outputs.tsa }}",
+                  "tsrUrl": ("$R/" + f + ".tsr") if os.path.exists(f + ".tsr") else None,
+                  "otsUrl": ("$R/" + f + ".ots") if os.path.exists(f + ".ots") else None}
+          req = urllib.request.Request(os.environ["FG_API_URL"] + "/jobs/anchor", data=json.dumps(data).encode(), headers={"Content-Type": "application/json", "x-jobs-secret": os.environ["JOBS_SECRET"]}, method="POST")
+          print(urllib.request.urlopen(req).read().decode()[:300])
+          PY
