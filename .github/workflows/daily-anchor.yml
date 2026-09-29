@@ -16,7 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 무결성 점검(체인 재계산 + payload 해시 대조)
-        run: curl -sf -X POST "$FG_API_URL/jobs/integrity" -H "x-jobs-secret: $JOBS_SECRET" -H "Content-Type: application/json" -d '{}' | head -c 1500; echo
+        run: |
+          curl -sf -X POST "$FG_API_URL/jobs/integrity" -H "x-jobs-secret: $JOBS_SECRET" -H "Content-Type: application/json" -d '{}' | head -c 1500; echo
       - name: 일일 다이제스트 받기
         id: dg
         run: |
